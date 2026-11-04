@@ -1,0 +1,31 @@
+{
+ "actions": [],
+ "autoname": "naming_series:",
+ "creation": "2026-11-04 23:30:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": ["naming_series", "posting_date", "pos_profile", "column_break_1", "counted_by", "lines", "remarks", "amended_from"],
+ "fields": [
+  {"fieldname": "naming_series", "fieldtype": "Select", "label": "Series", "options": "BDT-.YYYY.-.#####", "default": "BDT-.YYYY.-.#####", "reqd": 1},
+  {"fieldname": "posting_date", "fieldtype": "Date", "label": "Date", "reqd": 1, "in_list_view": 1, "default": "Today"},
+  {"fieldname": "pos_profile", "fieldtype": "Link", "label": "Branch", "options": "POS Profile", "reqd": 1, "in_list_view": 1, "in_standard_filter": 1},
+  {"fieldname": "column_break_1", "fieldtype": "Column Break"},
+  {"fieldname": "counted_by", "fieldtype": "Link", "label": "Counted / Entered By", "options": "User", "default": "__user"},
+  {"fieldname": "lines", "fieldtype": "Table", "label": "Takings", "options": "Branch Takings Line", "reqd": 1},
+  {"fieldname": "remarks", "fieldtype": "Small Text", "label": "Remarks"},
+  {"fieldname": "amended_from", "fieldtype": "Link", "label": "Amended From", "options": "Branch Daily Takings", "read_only": 1, "no_copy": 1, "print_hide": 1}
+ ],
+ "is_submittable": 1,
+ "modified": "2026-11-04 23:30:00.000000",
+ "module": "Lyons Custom",
+ "name": "Branch Daily Takings",
+ "owner": "Administrator",
+ "permissions": [
+  {"role": "Accounts Manager", "read": 1, "write": 1, "create": 1, "submit": 1, "cancel": 1, "amend": 1, "delete": 1, "report": 1, "export": 1, "print": 1},
+  {"role": "Accounts User", "read": 1, "write": 1, "create": 1, "submit": 1, "report": 1, "print": 1}
+ ],
+ "sort_field": "posting_date",
+ "sort_order": "DESC",
+ "states": [],
+ "title_field": "pos_profile"
+}

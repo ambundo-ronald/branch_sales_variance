@@ -1,0 +1,22 @@
+[project]
+name = "branch_sales_variance"
+authors = [
+    { name = "Jorovin", email = "sales@jorovin.com" }
+]
+description = "Branch sales, banking, stock and cashier variance reporting for ERPNext POS branches"
+requires-python = ">=3.14,<3.15"
+readme = "README.md"
+dynamic = ["version"]
+dependencies = []
+
+[build-system]
+requires = ["flit_core >=3.4,<4"]
+build-backend = "flit_core.buildapi"
+
+[tool.bench.frappe-dependencies]
+frappe = ">=16.0.0-dev,<17.0.0-dev"
+erpnext = ">=16.0.0-dev,<17.0.0-dev"
+
+[tool.ruff]
+line-length = 110
+target-version = "py314"
