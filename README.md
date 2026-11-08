@@ -34,7 +34,8 @@ Permissions go to Accounts Manager, Accounts User and System Manager.
 
 | View | What it answers |
 |---|---|
-| Daily Money | Did each day's money reach the banks and the drawer? |
+| Daily Money | Did each day's money reach the banks and the drawer? Click a channel row to drill down. |
+| Channel Detail | GL-style drill-down for one channel: every invoice, Payment Entry, statement line and other entry behind its Daily Money line |
 | Cashier Summary | Sales, returns, collections and close-of-shift difference per cashier |
 | Stock Variance | What did each Stock Reconciliation count find, valued at the selling price? |
 | Stock Movement | Opening + purchases + transfers − sales = closing for every item that moved; which items weren't counted; which went negative |
@@ -50,7 +51,20 @@ For each channel and day, the report uses the first of these that exists:
 
 For banks with an imported statement, the non-sales amount is everything else booked into that bank account that day per the GL (other branches, old debts, transfers, journals). That makes the variance a statement-vs-books check for the account.
 
-System sales are this branch's Payment Entries allocated to same-day Sales Invoices, plus any invoice payments table, net of change. Credit sales are shown but **not** deducted again.
+**Invoiced Sales** = payments allocated to the day's invoices *whenever paid*, plus a Credit / Unpaid line. It ties to **Sales Register by Mode of Payment**, and the date total ties to the Sales Register.
+
+It is then bridged to what should have hit the bank or drawer that day:
+
+```
+Invoiced Sales
+ − Paid later / unpaid          (invoice today, money on a later date)
+ − Paid in advance              (invoice today, money received earlier)
+ + Old invoices paid today
+ + Advances received today
+ + Unallocated receipts         (branch cashiers' receipts not yet linked to an invoice)
+ = Expected Receipts
+Variance = Statement − Other money into the account − Expected Receipts
+```
 
 ### Configuration
 

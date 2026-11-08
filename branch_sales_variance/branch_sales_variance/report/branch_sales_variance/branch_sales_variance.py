@@ -3,17 +3,23 @@
 #
 # Views
 #   Daily Money    : statement vs system sales per channel (Sheet1 of the workbook)
+#   Cashier Summary: per-cashier sales, returns, collections and close-of-shift difference
+#   Stock Movement : opening + movements = closing per item, count coverage
 #   Stock Variance : stock reconciliation differences valued at selling price (Variance sheet)
 #   Returns Check  : credit notes with risk flags
 #
+#   Channel Detail : GL-style drill-down of one channel (click a channel row in Daily Money)
+#
 # Money logic per channel and day
-#   Statement      = Bank Transaction deposits (Equity / NCBA / I&M / Co-op) or the
-#                    manual figure in "Branch Daily Takings" (cash, Pochi, banks with no import)
-#   Non-sales      = everything else posted into that account that day per the GL
-#                    (debts collected, other branches, transfers, journals)  +  manual non-sales
-#   Bank net       = Statement - Non-sales
-#   System sales   = this branch's same-day sales collections in that channel
-#   Variance       = Bank net - System sales   (negative = short)
+#   Invoiced          = payments allocated to the day's invoices, whenever paid
+#                       (ties to Sales Register by Mode of Payment; unpaid shows as Credit / Unpaid)
+#   Expected receipts = Invoiced - paid later - paid in advance + old invoices paid today
+#                       + advances received today + unallocated receipts
+#   Statement         = manual takings > imported Bank Transactions > POS Closing Shift count
+#   Other money in    = everything else booked into that bank account that day (GL)
+#   Variance          = Statement - Other money in - Expected receipts   (negative = short)
+
+import re
 
 import frappe
 from frappe import _
@@ -47,6 +53,8 @@ def execute(filters=None):
         return stock_movement(filters)
     if view == "Cashier Summary":
         return cashier_summary(filters)
+    if view == "Channel Detail":
+        return channel_detail(filters)
     if view == "Returns Check":
         return returns_check(filters)
     return daily_money(filters)
@@ -80,25 +88,68 @@ def channel_of(mop):
     return MOP_CHANNEL.get(mop, "other")
 
 
+RECEIPT_KEYS = ("invoiced", "paid_later", "paid_earlier", "old_paid", "advance", "unallocated")
+MONEY_KEYS = RECEIPT_KEYS + ("receipts", "statement", "other_in", "variance")
+
+
+def mop_condition(ch, alias="pe"):
+    """SQL condition + params selecting the modes of payment of one channel."""
+    if ch == "other":
+        return f"IFNULL({alias}.mode_of_payment, '') NOT IN %(mapped_mops)s", {
+            "mapped_mops": tuple(MOP_CHANNEL) or ("",)}
+    return f"{alias}.mode_of_payment IN %(ch_mops)s", {
+        "ch_mops": tuple(dict((c[0], c[2]) for c in CHANNELS)[ch]) or ("",)}
+
+
+def branch_users(f):
+    return [r[0] for r in frappe.db.sql(
+        "SELECT user FROM `tabPOS Profile User` WHERE parent = %s", f.pos_profile)] or [""]
+
+
+def bank_setup(f):
+    """Channels whose bank statements are imported for the range, with their GL accounts."""
+    bank_accounts = {c[0]: c[3] for c in CHANNELS if c[3]}
+    if not bank_accounts or not f.get("use_bank_statements", 1):
+        return {}, {}
+    gl_account = dict(frappe.db.sql(
+        "SELECT name, account FROM `tabBank Account` WHERE name IN %(n)s",
+        {"n": tuple(bank_accounts.values())}))
+    imported = {r[0] for r in frappe.db.sql("""
+        SELECT DISTINCT bank_account FROM `tabBank Transaction`
+        WHERE docstatus = 1 AND bank_account IN %(ba)s
+          AND date BETWEEN %(from_date)s AND %(to_date)s""",
+        dict(f, ba=tuple(bank_accounts.values())))}
+    ch_bank = {k: v for k, v in bank_accounts.items() if v in imported}
+    ch_account = {k: gl_account.get(v) for k, v in ch_bank.items() if gl_account.get(v)}
+    return ch_bank, ch_account
+
+
 def daily_money(f):
-    days = {}  # date -> {"_": {...}, channel: {...}}
+    """Per day and channel:
+        Invoiced (= Sales Register by Mode of Payment)
+        - paid later - paid earlier + old invoices paid today + advances + unallocated
+        = Expected receipts today
+        Variance = Statement - Other money in the account - Expected receipts
+    """
+    days = {}
+    from_d, to_d = getdate(f.from_date), getdate(f.to_date)
+    in_range = lambda d: d is not None and from_d <= getdate(d) <= to_d
 
     def cell(d, ch):
         day = days.setdefault(getdate(d), {})
-        return day.setdefault(ch, {"statement": 0.0, "non_sales": 0.0, "system": 0.0,
-                                   "gl_in": 0.0, "manual_stmt": None, "manual_ns": 0.0,
-                                   "shift_stmt": None})
-
-    imported_channels = set()
-    shift_stats = {"total": 0, "uncounted": 0, "multi_day": 0}
+        c = day.get(ch)
+        if c is None:
+            c = day[ch] = {k: 0.0 for k in MONEY_KEYS}
+            c.update(gl_in=0.0, manual_stmt=None, manual_ns=0.0, shift_stmt=None)
+        return c
 
     def head(d):
-        day = days.setdefault(getdate(d), {})
-        return day.setdefault("_", {"gross": 0.0, "returns": 0.0, "collected": 0.0, "debts": 0.0})
+        return days.setdefault(getdate(d), {}).setdefault("_", {"gross": 0.0, "returns": 0.0})
 
-    params = dict(f)
+    p = dict(f)
+    shift_stats = {"total": 0, "uncounted": 0, "multi_day": 0}
 
-    # 1. sales and returns
+    # 1. sales and returns (ties to Sales Register)
     for r in frappe.db.sql(f"""
         SELECT si.posting_date d,
             SUM(CASE WHEN si.is_return = 0 THEN IF(si.rounded_total, si.rounded_total, si.grand_total) ELSE 0 END) gross,
@@ -106,84 +157,100 @@ def daily_money(f):
         FROM `tabSales Invoice` si
         WHERE si.docstatus = 1 AND si.company = %(company)s
           AND si.posting_date BETWEEN %(from_date)s AND %(to_date)s AND {BRANCH_COND}
-        GROUP BY si.posting_date""", params, as_dict=True):
+        GROUP BY si.posting_date""", p, as_dict=True):
         h = head(r.d)
         h["gross"] += flt(r.gross)
         h["returns"] += flt(r.returns)
 
-    # 2. collections through Payment Entries (how POSNext records payments here)
+    # 2. payments allocated to this period's invoices, whenever they were paid
     for r in frappe.db.sql(f"""
-        SELECT pe.posting_date d, pe.mode_of_payment mop,
-            SUM(CASE WHEN si.posting_date = pe.posting_date THEN per.allocated_amount ELSE 0 END) same_day,
-            SUM(CASE WHEN si.posting_date <> pe.posting_date THEN per.allocated_amount ELSE 0 END) debts
+        SELECT si.posting_date sd, pe.posting_date pd, pe.mode_of_payment mop,
+            SUM(per.allocated_amount) amt
         FROM `tabPayment Entry Reference` per
         JOIN `tabPayment Entry` pe ON pe.name = per.parent
         JOIN `tabSales Invoice` si ON si.name = per.reference_name
         WHERE pe.docstatus = 1 AND pe.payment_type = 'Receive' AND pe.company = %(company)s
-          AND per.reference_doctype = 'Sales Invoice'
-          AND pe.posting_date BETWEEN %(from_date)s AND %(to_date)s AND {BRANCH_COND}
-        GROUP BY pe.posting_date, pe.mode_of_payment""", params, as_dict=True):
-        cell(r.d, channel_of(r.mop))["system"] += flt(r.same_day)
-        h = head(r.d)
-        h["collected"] += flt(r.same_day)
-        h["debts"] += flt(r.debts)
+          AND per.reference_doctype = 'Sales Invoice' AND si.docstatus = 1
+          AND si.posting_date BETWEEN %(from_date)s AND %(to_date)s AND {BRANCH_COND}
+        GROUP BY si.posting_date, pe.posting_date, pe.mode_of_payment""", p, as_dict=True):
+        ch, amt, sd, pd = channel_of(r.mop), flt(r.amt), getdate(r.sd), getdate(r.pd)
+        cell(sd, ch)["invoiced"] += amt
+        if pd > sd:
+            cell(sd, ch)["paid_later"] -= amt
+            if in_range(pd):
+                cell(pd, ch)["old_paid"] += amt
+        elif pd < sd:
+            cell(sd, ch)["paid_earlier"] -= amt
+            if in_range(pd):
+                cell(pd, ch)["advance"] += amt
 
-    # 3. collections inside the invoice itself (is_pos payments table), net of change
+    # 3. money received in the period for invoices dated outside it
+    for r in frappe.db.sql(f"""
+        SELECT pe.posting_date pd, pe.mode_of_payment mop,
+            SUM(CASE WHEN si.posting_date < %(from_date)s THEN per.allocated_amount ELSE 0 END) older,
+            SUM(CASE WHEN si.posting_date > %(to_date)s THEN per.allocated_amount ELSE 0 END) future
+        FROM `tabPayment Entry Reference` per
+        JOIN `tabPayment Entry` pe ON pe.name = per.parent
+        JOIN `tabSales Invoice` si ON si.name = per.reference_name
+        WHERE pe.docstatus = 1 AND pe.payment_type = 'Receive' AND pe.company = %(company)s
+          AND per.reference_doctype = 'Sales Invoice' AND si.docstatus = 1
+          AND pe.posting_date BETWEEN %(from_date)s AND %(to_date)s
+          AND (si.posting_date < %(from_date)s OR si.posting_date > %(to_date)s) AND {BRANCH_COND}
+        GROUP BY pe.posting_date, pe.mode_of_payment""", p, as_dict=True):
+        c = cell(r.pd, channel_of(r.mop))
+        c["old_paid"] += flt(r.older)
+        c["advance"] += flt(r.future)
+
+    # 4. receipts by this branch's cashiers not yet allocated to any invoice
+    for r in frappe.db.sql("""
+        SELECT pe.posting_date pd, pe.mode_of_payment mop, SUM(pe.unallocated_amount) amt
+        FROM `tabPayment Entry` pe
+        WHERE pe.docstatus = 1 AND pe.payment_type = 'Receive' AND pe.party_type = 'Customer'
+          AND pe.company = %(company)s AND pe.unallocated_amount > 0 AND pe.owner IN %(users)s
+          AND pe.posting_date BETWEEN %(from_date)s AND %(to_date)s
+        GROUP BY pe.posting_date, pe.mode_of_payment""",
+        dict(p, users=tuple(branch_users(f))), as_dict=True):
+        cell(r.pd, channel_of(r.mop))["unallocated"] += flt(r.amt)
+
+    # 5. payments inside the invoice itself (is_pos payments table), net of change
     for r in frappe.db.sql(f"""
         SELECT si.posting_date d, sip.mode_of_payment mop, SUM(sip.base_amount) amt
         FROM `tabSales Invoice Payment` sip
         JOIN `tabSales Invoice` si ON si.name = sip.parent
         WHERE si.docstatus = 1 AND si.is_pos = 1 AND si.company = %(company)s
           AND si.posting_date BETWEEN %(from_date)s AND %(to_date)s AND {BRANCH_COND}
-        GROUP BY si.posting_date, sip.mode_of_payment""", params, as_dict=True):
-        cell(r.d, channel_of(r.mop))["system"] += flt(r.amt)
-        head(r.d)["collected"] += flt(r.amt)
+        GROUP BY si.posting_date, sip.mode_of_payment""", p, as_dict=True):
+        cell(r.d, channel_of(r.mop))["invoiced"] += flt(r.amt)
     for r in frappe.db.sql(f"""
         SELECT si.posting_date d, SUM(si.base_change_amount) chg
         FROM `tabSales Invoice` si
         WHERE si.docstatus = 1 AND si.is_pos = 1 AND si.company = %(company)s
           AND si.posting_date BETWEEN %(from_date)s AND %(to_date)s AND {BRANCH_COND}
-        GROUP BY si.posting_date HAVING chg <> 0""", params, as_dict=True):
-        cell(r.d, "cash")["system"] -= flt(r.chg)
-        head(r.d)["collected"] -= flt(r.chg)
+        GROUP BY si.posting_date HAVING chg <> 0""", p, as_dict=True):
+        cell(r.d, "cash")["invoiced"] -= flt(r.chg)
 
-    # 4. bank statements (imported Bank Transactions) and everything booked into each bank
-    bank_accounts = {c[0]: c[3] for c in CHANNELS if c[3]}
-    if bank_accounts and f.get("use_bank_statements", 1):
-        gl_account = dict(frappe.db.sql(
-            "SELECT name, account FROM `tabBank Account` WHERE name IN %(n)s",
-            {"n": tuple(bank_accounts.values())}))
-        ba_channel = {v: k for k, v in bank_accounts.items()}
-        # only banks whose statements are actually imported for this range
-        imported = {r[0] for r in frappe.db.sql("""
-            SELECT DISTINCT bank_account FROM `tabBank Transaction`
-            WHERE docstatus = 1 AND bank_account IN %(ba)s
-              AND date BETWEEN %(from_date)s AND %(to_date)s""",
-            dict(params, ba=tuple(bank_accounts.values())))}
-        acc_channel = {gl_account[v]: k for k, v in bank_accounts.items()
-                       if gl_account.get(v) and v in imported}
-        imported_channels = {ba_channel[b] for b in imported}
-
+    # 6. bank statements and everything booked into each imported bank account
+    ch_bank, ch_account = bank_setup(f)
+    if ch_bank:
+        ba_channel = {v: k for k, v in ch_bank.items()}
         for r in frappe.db.sql("""
             SELECT date d, bank_account ba, SUM(deposit) dep
             FROM `tabBank Transaction`
             WHERE docstatus = 1 AND bank_account IN %(ba)s
               AND date BETWEEN %(from_date)s AND %(to_date)s
-            GROUP BY date, bank_account""",
-            dict(params, ba=tuple(bank_accounts.values())), as_dict=True):
+            GROUP BY date, bank_account""", dict(p, ba=tuple(ch_bank.values())), as_dict=True):
             cell(r.d, ba_channel[r.ba])["statement"] += flt(r.dep)
+    if ch_account:
+        acc_channel = {v: k for k, v in ch_account.items()}
+        for r in frappe.db.sql("""
+            SELECT posting_date d, account acc, SUM(debit) dr
+            FROM `tabGL Entry`
+            WHERE is_cancelled = 0 AND company = %(company)s AND account IN %(acc)s
+              AND posting_date BETWEEN %(from_date)s AND %(to_date)s
+            GROUP BY posting_date, account""", dict(p, acc=tuple(acc_channel)), as_dict=True):
+            cell(r.d, acc_channel[r.acc])["gl_in"] += flt(r.dr)
 
-        if acc_channel:
-            for r in frappe.db.sql("""
-                SELECT posting_date d, account acc, SUM(debit) dr
-                FROM `tabGL Entry`
-                WHERE is_cancelled = 0 AND company = %(company)s AND account IN %(acc)s
-                  AND posting_date BETWEEN %(from_date)s AND %(to_date)s
-                GROUP BY posting_date, account""",
-                dict(params, acc=tuple(acc_channel.keys())), as_dict=True):
-                cell(r.d, acc_channel[r.acc])["gl_in"] += flt(r.dr)
-
-    # 5. manual takings (cash count, Pochi statement, I&M/Co-op if not imported)
+    # 7. manual takings
     if frappe.db.table_exists("Branch Daily Takings"):
         for r in frappe.db.sql("""
             SELECT t.posting_date d, l.channel ch,
@@ -193,17 +260,16 @@ def daily_money(f):
             JOIN `tabBranch Daily Takings` t ON t.name = l.parent
             WHERE t.docstatus = 1 AND t.pos_profile = %(pos_profile)s
               AND t.posting_date BETWEEN %(from_date)s AND %(to_date)s
-            GROUP BY t.posting_date, l.channel""", params, as_dict=True):
+            GROUP BY t.posting_date, l.channel""", p, as_dict=True):
             c = cell(r.d, LABEL_CHANNEL.get(r.ch, "other"))
             if r.has_stmt:
                 c["manual_stmt"] = flt(r.stmt)
             c["manual_ns"] += flt(r.ns)
 
-    # 6. POSNext closing shifts: the cashier's counted amount per mode of payment
+    # 8. POSNext closing shifts
     for shift in get_closing_shifts(f):
         shift_stats["total"] += 1
-        if shift.multi_day:
-            shift_stats["multi_day"] += 1
+        shift_stats["multi_day"] += 1 if shift.multi_day else 0
         if not shift.counted:
             shift_stats["uncounted"] += 1
             continue
@@ -211,28 +277,374 @@ def daily_money(f):
             c = cell(shift.posting_date, channel_of(mop))
             c["shift_stmt"] = (c["shift_stmt"] or 0.0) + amt
 
-    # resolve each day/channel.  Priority: manual takings > imported bank statement > closing shift
+    # resolve. Statement priority: manual takings > imported bank statement > closing shift
     for d, day in days.items():
-        for ch, c in day.items():
+        h = day.get("_", {"gross": 0.0, "returns": 0.0})
+        channel_invoiced = 0.0
+        for ch, c in list(day.items()):
             if ch == "_":
                 continue
-            auto_ns = 0.0
+            c["receipts"] = sum(c[k] for k in RECEIPT_KEYS)
+            other = 0.0
             if c["manual_stmt"] is not None:
-                c["statement"] = c["manual_stmt"]
-                c["source"] = "Manual"
-            elif ch in imported_channels:
+                c["statement"], c["source"] = c["manual_stmt"], "Manual"
+            elif ch in ch_bank:
                 c["source"] = "Bank Statement"
-                auto_ns = c["gl_in"] - c["system"]  # booked into the account but not this branch's same-day sales
+                other = c["gl_in"] - c["receipts"]  # in the account but not this branch's receipts
             elif c["shift_stmt"] is not None:
-                c["statement"] = c["shift_stmt"]
-                c["source"] = "Closing Shift"
+                c["statement"], c["source"] = c["shift_stmt"], "Closing Shift"
             else:
-                c["statement"] = 0.0
-                c["source"] = "No Statement" if c["system"] else ""
-            c["non_sales"] = auto_ns + c["manual_ns"]
+                c["source"] = "No Statement" if c["receipts"] else ""
+            c["other_in"] = -(other + c["manual_ns"])
+            c["variance"] = c["statement"] + c["other_in"] - c["receipts"]
+            channel_invoiced += c["invoiced"]
+        unpaid = h["gross"] + h["returns"] - channel_invoiced
+        if abs(unpaid) > 0.005:
+            c = cell(d, "credit")
+            c["invoiced"] = unpaid
+            c["paid_later"] = -unpaid  # will be collected later, or never
+            c["source"] = "Unpaid / Credit"
 
     return (get_money_columns(), build_money_rows(days, f), None, None,
             money_summary(days, shift_stats))
+
+
+def build_money_rows(days, f):
+    period = f.get("period") or "Day"
+    agg, ranges = {}, {}
+    for d, day in days.items():
+        k = period_key(d, period)
+        lo, hi = ranges.get(k, (d, d))
+        ranges[k] = (min(lo, d), max(hi, d))
+        pday = agg.setdefault(k, {})
+        for ch, c in day.items():
+            t = pday.setdefault(ch, {})
+            for key, v in c.items():
+                if isinstance(v, float):
+                    t[key] = t.get(key, 0.0) + v
+            if ch != "_" and c.get("source"):
+                t.setdefault("sources", set()).add(c["source"])
+
+    rows, order = [], [c[0] for c in CHANNELS] + ["credit"]
+    for k in sorted(agg):
+        day = agg[k]
+        h = day.get("_", {})
+        lo, hi = ranges[k]
+        if period == "Week":
+            lo, hi = k, add_days(k, 6)
+        elif period == "Month":
+            lo, hi = k, add_days(add_days(k, 32).replace(day=1), -1)
+        lo, hi = max(lo, getdate(f.from_date)), min(hi, getdate(f.to_date))
+        parent = {"name": str(k), "label": formatdate(k), "indent": 0,
+                  "gross_sales": h.get("gross", 0), "returns": h.get("returns", 0),
+                  "period_from": str(lo), "period_to": str(hi)}
+        for key in MONEY_KEYS:
+            parent[key] = 0.0
+        children = []
+        for ch in order:
+            c = day.get(ch)
+            if not c or not any(abs(c.get(x, 0)) > 0.005 for x in MONEY_KEYS):
+                continue
+            row = {"name": f"{k}-{ch}", "parent_name": str(k), "indent": 1,
+                   "label": CHANNEL_LABEL.get(ch, "Credit / Unpaid"), "channel": CHANNEL_LABEL.get(ch, "Credit / Unpaid"),
+                   "period_from": str(lo), "period_to": str(hi),
+                   "source": ", ".join(sorted(c.get("sources") or []))}
+            for key in MONEY_KEYS:
+                row[key] = c.get(key, 0.0)
+                parent[key] += row[key]
+            children.append(row)
+        rows.append(parent)
+        rows.extend(children)
+
+    if rows:
+        total = {"label": _("Total"), "indent": 0, "bold": 1}
+        for key in MONEY_KEYS + ("gross_sales", "returns"):
+            total[key] = sum(r.get(key, 0) for r in rows if r["indent"] == 0)
+        rows.append(total)
+    return rows
+
+
+def money_summary(days, shift_stats):
+    t = dict.fromkeys(("inv", "rec", "stmt", "var", "missing"), 0.0)
+    for day in days.values():
+        for ch, c in day.items():
+            if ch == "_":
+                continue
+            t["inv"] += c["invoiced"]
+            t["rec"] += c["receipts"]
+            t["stmt"] += c["statement"]
+            t["var"] += c["variance"]
+            if c.get("source") == "No Statement":
+                t["missing"] += c["receipts"]
+    return [
+        {"label": _("Invoiced Sales (= Sales Register)"), "value": t["inv"], "datatype": "Currency"},
+        {"label": _("Expected Receipts"), "value": t["rec"], "datatype": "Currency"},
+        {"label": _("Statement Received"), "value": t["stmt"], "datatype": "Currency"},
+        {"label": _("Net Variance"), "value": t["var"], "datatype": "Currency",
+         "indicator": "Red" if t["var"] < -0.5 else "Green"},
+        {"label": _("Receipts With No Statement"), "value": t["missing"], "datatype": "Currency",
+         "indicator": "Orange" if t["missing"] else "Green"},
+        {"label": _("Shifts Closed Without Count"),
+         "value": f"{shift_stats['uncounted']} / {shift_stats['total']}", "datatype": "Data",
+         "indicator": "Orange" if shift_stats["uncounted"] else "Green"},
+    ]
+
+
+def get_money_columns():
+    cur = lambda fn, lb, w=125: {"fieldname": fn, "label": _(lb), "fieldtype": "Currency", "width": w}
+    return [
+        {"fieldname": "label", "label": _("Date / Channel"), "fieldtype": "Data", "width": 170},
+        cur("invoiced", "Invoiced Sales"),
+        cur("paid_later", "Paid Later / Unpaid (−)", 150),
+        cur("paid_earlier", "Paid in Advance (−)", 140),
+        cur("old_paid", "Old Invoices Paid (+)", 145),
+        cur("advance", "Advances Received (+)", 145),
+        cur("unallocated", "Unallocated (+)"),
+        cur("receipts", "Expected Receipts", 135),
+        cur("statement", "Statement"),
+        cur("other_in", "Other Money In (−)", 135),
+        cur("variance", "Variance"),
+        {"fieldname": "source", "label": _("Statement Source"), "fieldtype": "Data", "width": 130},
+        cur("gross_sales", "Gross Sales"),
+        cur("returns", "Returns"),
+    ]
+
+
+# --------------------------------------------------------------------------- channel drill-down
+def _tokens(*texts):
+    out = set()
+    for t in texts:
+        for tok in re.split(r"[^A-Za-z0-9]+", (t or "").upper()):
+            if len(tok) >= 6:
+                out.add(tok)
+    return out
+
+
+def channel_detail(f):
+    """GL-style drill-down for one channel: every invoice, payment, statement line and
+    other entry that makes up that channel's line in Daily Money."""
+    label = f.get("channel")
+    if not label:
+        frappe.throw(_("Pick a Channel, or click a channel row in Daily Money"))
+    if label == "Credit / Unpaid":
+        return credit_detail(f)
+    ch = LABEL_CHANNEL[label]
+    cond, cp = mop_condition(ch)
+    p = dict(f, **cp)
+    ch_bank, ch_account = bank_setup(f)
+    bank_account, account = ch_bank.get(ch), ch_account.get(ch)
+
+    # statement lines first, so receipts can be marked as seen in the bank
+    stmt_rows, bt_tokens, bt_matched_pe = [], set(), {}
+    if bank_account:
+        bts = frappe.db.sql("""
+            SELECT name, date, deposit, reference_number, description, status, unallocated_amount
+            FROM `tabBank Transaction`
+            WHERE docstatus = 1 AND bank_account = %(ba)s AND deposit > 0
+              AND date BETWEEN %(from_date)s AND %(to_date)s
+            ORDER BY date, name""", dict(p, ba=bank_account), as_dict=True)
+        links = {}
+        if bts:
+            for r in frappe.db.sql("""
+                SELECT parent, payment_document, payment_entry FROM `tabBank Transaction Payments`
+                WHERE parent IN %(n)s""", {"n": tuple(b.name for b in bts)}, as_dict=True):
+                links.setdefault(r.parent, []).append(r)
+                if r.payment_document == "Payment Entry":
+                    bt_matched_pe[r.payment_entry] = r.parent
+        for b in bts:
+            bt_tokens |= _tokens(b.reference_number, b.description)
+            linked = links.get(b.name, [])
+            stmt_rows.append({
+                "posting_date": b.date, "voucher_type": "Bank Transaction", "voucher_no": b.name,
+                "reference_no": b.reference_number, "party": (b.description or "")[:80],
+                "amount": flt(b.deposit),
+                "status": ("Matched: " + ", ".join(l.payment_entry for l in linked)) if linked else "Not matched",
+            })
+    else:
+        for s in get_closing_shifts(f):
+            amt = sum(v for m, v in s.closing.items() if channel_of(m) == ch)
+            exp = sum(v for m, v in s.expected.items() if channel_of(m) == ch)
+            if amt or exp:
+                stmt_rows.append({
+                    "posting_date": s.posting_date, "voucher_type": "POS Closing Shift", "voucher_no": s.name,
+                    "party": s.user, "amount": amt if s.counted else 0.0,
+                    "status": f"Expected {exp:,.2f}" + ("" if s.counted else " (closed without count)"),
+                })
+        if frappe.db.table_exists("Branch Daily Takings"):
+            for r in frappe.db.sql("""
+                SELECT t.name, t.posting_date, l.statement_amount, l.non_sales_amount, l.remarks
+                FROM `tabBranch Takings Line` l JOIN `tabBranch Daily Takings` t ON t.name = l.parent
+                WHERE t.docstatus = 1 AND t.pos_profile = %(pos_profile)s AND l.channel = %(label)s
+                  AND t.posting_date BETWEEN %(from_date)s AND %(to_date)s""",
+                dict(p, label=label), as_dict=True):
+                stmt_rows.append({
+                    "posting_date": r.posting_date, "voucher_type": "Branch Daily Takings", "voucher_no": r.name,
+                    "amount": flt(r.statement_amount), "party": r.remarks,
+                    "status": f"Manual (non-sales {flt(r.non_sales_amount):,.2f})" if r.non_sales_amount else "Manual",
+                })
+
+    def seen_in_bank(pe, ref):
+        if not bank_account:
+            return ""
+        if pe in bt_matched_pe:
+            return "In bank: " + bt_matched_pe[pe]
+        if ref and ref.upper() in bt_tokens:
+            return "Ref on statement (not matched)"
+        return "Not on statement"
+
+    # invoices of the period and how each was paid
+    inv_rows, rec_rows = [], []
+    from_d, to_d = getdate(f.from_date), getdate(f.to_date)
+    for r in frappe.db.sql(f"""
+        SELECT si.name invoice, si.posting_date sd, si.owner cashier, si.customer,
+            pe.name pe, pe.posting_date pd, pe.reference_no, per.allocated_amount amt
+        FROM `tabPayment Entry Reference` per
+        JOIN `tabPayment Entry` pe ON pe.name = per.parent
+        JOIN `tabSales Invoice` si ON si.name = per.reference_name
+        WHERE pe.docstatus = 1 AND pe.payment_type = 'Receive' AND pe.company = %(company)s
+          AND per.reference_doctype = 'Sales Invoice' AND si.docstatus = 1 AND {cond}
+          AND (si.posting_date BETWEEN %(from_date)s AND %(to_date)s
+               OR pe.posting_date BETWEEN %(from_date)s AND %(to_date)s) AND {BRANCH_COND}
+        ORDER BY si.posting_date, si.name""", p, as_dict=True):
+        sd, pd = getdate(r.sd), getdate(r.pd)
+        base = {"voucher_type": "Payment Entry", "voucher_no": r.pe, "invoice": r.invoice,
+                "invoice_date": sd, "payment_date": pd, "reference_no": r.reference_no,
+                "party": r.cashier, "amount": flt(r.amt)}
+        if from_d <= sd <= to_d:
+            status = "Same day" if pd == sd else ("Paid later" if pd > sd else "Paid in advance")
+            inv_rows.append(dict(base, posting_date=sd, status=status))
+        if from_d <= pd <= to_d:
+            kind = ("Same day" if pd == sd else "Old invoice" if sd < pd else "Advance")
+            rec_rows.append(dict(base, posting_date=pd, status=kind + " · " + seen_in_bank(r.pe, r.reference_no)
+                                 if bank_account else kind))
+
+    for r in frappe.db.sql(f"""
+        SELECT pe.name, pe.posting_date, pe.reference_no, pe.party, pe.owner, pe.unallocated_amount amt
+        FROM `tabPayment Entry` pe
+        WHERE pe.docstatus = 1 AND pe.payment_type = 'Receive' AND pe.party_type = 'Customer'
+          AND pe.company = %(company)s AND pe.unallocated_amount > 0 AND pe.owner IN %(users)s AND {cond}
+          AND pe.posting_date BETWEEN %(from_date)s AND %(to_date)s""",
+        dict(p, users=tuple(branch_users(f))), as_dict=True):
+        rec_rows.append({"posting_date": r.posting_date, "voucher_type": "Payment Entry", "voucher_no": r.name,
+                         "reference_no": r.reference_no, "party": f"{r.party} ({r.owner})", "amount": flt(r.amt),
+                         "status": "Unallocated" + (" · " + seen_in_bank(r.name, r.reference_no) if bank_account else "")})
+
+    # other money booked into the account
+    other_rows = []
+    branch_pes = {r["voucher_no"] for r in rec_rows}
+    if account:
+        for r in frappe.db.sql("""
+            SELECT posting_date, voucher_type, voucher_no, party, against, remarks, SUM(debit) amt
+            FROM `tabGL Entry`
+            WHERE is_cancelled = 0 AND company = %(company)s AND account = %(acc)s AND debit > 0
+              AND posting_date BETWEEN %(from_date)s AND %(to_date)s
+            GROUP BY posting_date, voucher_type, voucher_no
+            ORDER BY posting_date, voucher_no""", dict(p, acc=account), as_dict=True):
+            amt = flt(r.amt)
+            if r.voucher_type == "Payment Entry" and r.voucher_no in branch_pes:
+                # part of the PE may belong to another branch's invoices
+                amt -= sum(x["amount"] for x in rec_rows if x["voucher_no"] == r.voucher_no)
+                if abs(amt) < 0.005:
+                    continue
+                status = "Same receipt, other branch's share"
+            else:
+                status = "Other branch / debt / transfer / journal"
+            other_rows.append({"posting_date": r.posting_date, "voucher_type": r.voucher_type,
+                               "voucher_no": r.voucher_no, "party": r.party or (r.against or "")[:60],
+                               "amount": -amt, "status": status + (f" · {r.remarks[:60]}" if r.remarks else "")})
+        # same receipt counted twice if a branch PE also sits in "other": guard negative shares
+        other_rows = [r for r in other_rows if abs(r["amount"]) > 0.005]
+
+    invoiced = sum(r["amount"] for r in inv_rows)
+    receipts = sum(r["amount"] for r in rec_rows)
+    statement = sum(r["amount"] for r in stmt_rows)
+    other = sum(r["amount"] for r in other_rows)
+    variance = statement + other - receipts
+
+    rows = []
+
+    def section(key, title, items, note=""):
+        total = sum(r["amount"] for r in items)
+        rows.append({"name": key, "label": f"{title} ({len(items)})", "indent": 0, "amount": total,
+                     "status": note, "bold": 1})
+        for i, r in enumerate(items):
+            rows.append(dict(r, name=f"{key}-{i}", parent_name=key, indent=1,
+                             label=r.get("invoice") or r.get("voucher_no")))
+
+    section("inv", _("Invoiced Sales: invoices of the period, by payment"), inv_rows,
+            _("Ties to Sales Register by Mode of Payment"))
+    section("rec", _("Receipts in the period"), rec_rows, _("Money this branch received"))
+    section("stmt", _("Statement") if bank_account else _("Counted / Declared"), stmt_rows,
+            label + (" bank statement" if bank_account else ""))
+    if account:
+        section("oth", _("Other money into the account"), other_rows, account)
+    rows.append({"label": _("Variance = Statement + Other − Receipts"), "indent": 0, "bold": 1,
+                 "amount": variance, "status": ""})
+
+    unmatched_bt = sum(1 for r in stmt_rows if r.get("status") == "Not matched")
+    not_on_stmt = sum(1 for r in rec_rows if "Not on statement" in (r.get("status") or ""))
+    summary = [
+        {"label": _("Invoiced ({0})").format(label), "value": invoiced, "datatype": "Currency"},
+        {"label": _("Receipts"), "value": receipts, "datatype": "Currency"},
+        {"label": _("Statement"), "value": statement, "datatype": "Currency"},
+        {"label": _("Other Money In"), "value": other, "datatype": "Currency"},
+        {"label": _("Variance"), "value": variance, "datatype": "Currency",
+         "indicator": "Red" if variance < -0.5 else "Green"},
+    ]
+    if bank_account:
+        summary += [
+            {"label": _("Statement Lines Not Matched"), "value": unmatched_bt, "datatype": "Int",
+             "indicator": "Orange" if unmatched_bt else "Green"},
+            {"label": _("Receipts Not on Statement"), "value": not_on_stmt, "datatype": "Int",
+             "indicator": "Red" if not_on_stmt else "Green"},
+        ]
+    return detail_columns(), rows, None, None, summary
+
+
+def credit_detail(f):
+    rows = frappe.db.sql(f"""
+        SELECT si.name invoice, si.posting_date, si.customer, si.owner,
+            IF(si.rounded_total, si.rounded_total, si.grand_total) total,
+            IFNULL((SELECT SUM(per.allocated_amount) FROM `tabPayment Entry Reference` per
+                    JOIN `tabPayment Entry` pe ON pe.name = per.parent
+                    WHERE per.reference_doctype = 'Sales Invoice' AND per.reference_name = si.name
+                      AND pe.docstatus = 1), 0) paid,
+            IFNULL((SELECT SUM(sip.base_amount) FROM `tabSales Invoice Payment` sip
+                    WHERE sip.parent = si.name), 0) - IFNULL(si.base_change_amount, 0) pos_paid,
+            si.outstanding_amount, si.is_return, si.return_against
+        FROM `tabSales Invoice` si
+        WHERE si.docstatus = 1 AND si.company = %(company)s
+          AND si.posting_date BETWEEN %(from_date)s AND %(to_date)s AND {BRANCH_COND}""", dict(f), as_dict=True)
+    out = []
+    for r in rows:
+        unpaid = flt(r.total) - flt(r.paid) - flt(r.pos_paid)
+        if abs(unpaid) < 0.005:
+            continue
+        out.append({"posting_date": r.posting_date, "voucher_type": "Sales Invoice", "voucher_no": r.invoice,
+                    "invoice": r.invoice, "label": r.invoice, "invoice_date": r.posting_date,
+                    "party": f"{r.customer} ({r.owner})", "amount": unpaid, "indent": 0,
+                    "status": ("Return against " + r.return_against if r.is_return and r.return_against
+                               else "Return" if r.is_return else f"Outstanding now {flt(r.outstanding_amount):,.2f}")})
+    total = sum(r["amount"] for r in out)
+    summary = [{"label": _("Unpaid at Invoice Date"), "value": total, "datatype": "Currency"},
+               {"label": _("Invoices"), "value": len(out), "datatype": "Int"}]
+    return detail_columns(), out, None, None, summary
+
+
+def detail_columns():
+    return [
+        {"fieldname": "label", "label": _("Section / Document"), "fieldtype": "Data", "width": 260},
+        {"fieldname": "posting_date", "label": _("Date"), "fieldtype": "Date", "width": 95},
+        {"fieldname": "voucher_type", "label": _("Voucher Type"), "fieldtype": "Data", "width": 130},
+        {"fieldname": "voucher_no", "label": _("Voucher"), "fieldtype": "Dynamic Link", "options": "voucher_type", "width": 170},
+        {"fieldname": "invoice", "label": _("Invoice"), "fieldtype": "Link", "options": "Sales Invoice", "width": 165},
+        {"fieldname": "invoice_date", "label": _("Invoice Date"), "fieldtype": "Date", "width": 95},
+        {"fieldname": "payment_date", "label": _("Paid On"), "fieldtype": "Date", "width": 95},
+        {"fieldname": "reference_no", "label": _("Reference"), "fieldtype": "Data", "width": 120},
+        {"fieldname": "party", "label": _("Party / Cashier / Narration"), "fieldtype": "Data", "width": 200},
+        {"fieldname": "amount", "label": _("Amount"), "fieldtype": "Currency", "width": 120},
+        {"fieldname": "status", "label": _("Status"), "fieldtype": "Data", "width": 280},
+    ]
 
 
 def get_closing_shifts(f):
@@ -257,106 +669,6 @@ def get_closing_shifts(f):
         # a shift where every counted figure is zero was closed without counting
         s.counted = any(abs(v) > 0.005 for v in s.closing.values())
     return list(shifts.values())
-
-
-def build_money_rows(days, f):
-    period = f.get("period") or "Day"
-    agg = {}
-    for d, day in days.items():
-        p = agg.setdefault(period_key(d, period), {})
-        for ch, c in day.items():
-            t = p.setdefault(ch, {})
-            for k, v in c.items():
-                if isinstance(v, float):
-                    t[k] = t.get(k, 0.0) + v
-            if ch != "_":
-                srcs = t.setdefault("sources", set())
-                if c.get("source"):
-                    srcs.add(c["source"])
-
-    rows, order = [], [c[0] for c in CHANNELS]
-    for p in sorted(agg):
-        day = agg[p]
-        h = day.get("_", {})
-        net_sales = h.get("gross", 0) + h.get("returns", 0)
-        parent = {
-            "name": str(p), "label": formatdate(p), "indent": 0,
-            "gross_sales": h.get("gross", 0), "returns": h.get("returns", 0),
-            "net_sales": net_sales, "credit_sales": net_sales - h.get("collected", 0),
-            "debts_collected": h.get("debts", 0),
-            "statement": 0, "non_sales": 0, "bank_net": 0, "system_sales": 0, "variance": 0,
-        }
-        children = []
-        for ch in order:
-            c = day.get(ch)
-            if not c or not any(abs(c.get(k, 0)) > 0.005 for k in ("statement", "non_sales", "system")):
-                continue
-            bank_net = c["statement"] - c["non_sales"]
-            row = {
-                "name": f"{p}-{ch}", "parent_name": str(p), "label": CHANNEL_LABEL[ch], "indent": 1,
-                "statement": c["statement"], "non_sales": c["non_sales"], "bank_net": bank_net,
-                "system_sales": c["system"], "variance": bank_net - c["system"],
-                "source": ", ".join(sorted(c.get("sources") or [])),
-            }
-            for k in ("statement", "non_sales", "bank_net", "system_sales", "variance"):
-                parent[k] += row[k]
-            children.append(row)
-        rows.append(parent)
-        rows.extend(children)
-
-    if rows:
-        total = {"label": _("Total"), "indent": 0, "bold": 1}
-        for k in ("gross_sales", "returns", "net_sales", "credit_sales", "debts_collected",
-                  "statement", "non_sales", "bank_net", "system_sales", "variance"):
-            total[k] = sum(r.get(k, 0) for r in rows if r["indent"] == 0)
-        rows.append(total)
-    return rows
-
-
-def money_summary(days, shift_stats):
-    t = {"stmt": 0, "net": 0, "sys": 0, "missing": 0}
-    for day in days.values():
-        for ch, c in day.items():
-            if ch == "_":
-                continue
-            t["stmt"] += c["statement"]
-            t["net"] += c["statement"] - c["non_sales"]
-            t["sys"] += c["system"]
-            if c.get("source") == "No Statement":
-                t["missing"] += c["system"]
-    var = t["net"] - t["sys"]
-    return [
-        {"label": _("Statement Received"), "value": t["stmt"], "datatype": "Currency"},
-        {"label": _("Bank Net Sales"), "value": t["net"], "datatype": "Currency"},
-        {"label": _("System Sales Collected"), "value": t["sys"], "datatype": "Currency"},
-        {"label": _("Net Variance"), "value": var, "datatype": "Currency",
-         "indicator": "Red" if var < -0.5 else "Green"},
-        {"label": _("System Sales With No Statement"), "value": t["missing"], "datatype": "Currency",
-         "indicator": "Orange" if t["missing"] else "Green"},
-        {"label": _("Shifts Closed Without Count"),
-         "value": f"{shift_stats['uncounted']} / {shift_stats['total']}", "datatype": "Data",
-         "indicator": "Orange" if shift_stats["uncounted"] else "Green"},
-        {"label": _("Shifts Spanning Several Days"), "value": shift_stats["multi_day"], "datatype": "Int",
-         "indicator": "Orange" if shift_stats["multi_day"] else "Green"},
-    ]
-
-
-def get_money_columns():
-    cur = lambda fn, lb, w=130: {"fieldname": fn, "label": _(lb), "fieldtype": "Currency", "width": w}
-    return [
-        {"fieldname": "label", "label": _("Date / Channel"), "fieldtype": "Data", "width": 170},
-        cur("statement", "Statement"),
-        cur("non_sales", "Non-Sales / Debts"),
-        cur("bank_net", "Bank Net Sales"),
-        cur("system_sales", "System Sales"),
-        cur("variance", "Variance"),
-        cur("gross_sales", "Gross Sales"),
-        cur("returns", "Returns"),
-        cur("net_sales", "Net Sales"),
-        cur("credit_sales", "Credit Sales"),
-        cur("debts_collected", "Old Debts Collected"),
-        {"fieldname": "source", "label": _("Statement Source"), "fieldtype": "Data", "width": 130},
-    ]
 
 
 # --------------------------------------------------------------------------- stock
