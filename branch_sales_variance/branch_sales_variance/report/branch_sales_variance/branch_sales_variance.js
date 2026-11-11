@@ -44,7 +44,24 @@ frappe.query_reports["Branch Sales Variance"] = {
 			fieldtype: "Select",
 			options: ["", "Equity Bank", "I&M Bank", "NCBA", "Co-op Bank", "Pochi", "Cash", "Other", "Credit / Unpaid"],
 			depends_on: "eval:doc.view == 'Channel Detail'",
-			mandatory_depends_on: "eval:doc.view == 'Channel Detail'",
+			mandatory_depends_on: "eval:doc.view == 'Channel Detail' && !doc.bank_account",
+		},
+		{
+			fieldname: "bank_account",
+			label: __("Bank Account"),
+			fieldtype: "Link",
+			options: "Bank Account",
+			depends_on: "eval:['Daily Money', 'Channel Detail'].includes(doc.view)",
+			get_query: () => ({ filters: { is_company_account: 1 } }),
+			on_change() {
+				// a picked bank wins over an older channel choice in Channel Detail
+				const qr = frappe.query_report;
+				if (qr.get_filter_value("bank_account") && qr.get_filter_value("channel")) {
+					qr.set_filter_value("channel", "");
+				} else {
+					qr.refresh();
+				}
+			},
 		},
 		{
 			fieldname: "use_bank_statements",
@@ -101,16 +118,19 @@ frappe.query_reports["Branch Sales Variance"] = {
 				onclick="frappe.query_reports['Branch Sales Variance'].drill('${args[0]}','${args[1]}','${args[2]}'); return false;">${value}</a>`;
 		}
 
-		if (["variance", "value_at_sp", "adjustment_value", "close_difference", "recon_adjustment", "min_balance", "receipts_gap"].includes(column.fieldname)) {
+		if (["variance", "value_at_sp", "adjustment_value", "close_difference", "recon_adjustment", "min_balance"].includes(column.fieldname)) {
 			const v = flt(data[column.fieldname]);
 			if (v < -0.5) value = `<span style="color:var(--red-600);font-weight:600">${value}</span>`;
 			else if (v > 0.5) value = `<span style="color:var(--green-600)">${value}</span>`;
 		}
-		if (column.fieldname === "source" && data.source && data.source.includes("No Statement")) {
+		if (column.fieldname === "source" && data.source && /No Statement|No lines|never imported/i.test(data.source)) {
 			value = `<span style="color:var(--orange-600)">${value}</span>`;
 		}
 		if (column.fieldname === "flags" && data.flags) {
 			value = `<span style="color:var(--red-600)">${value}</span>`;
+		}
+		if (column.fieldname === "unchecked" && flt(data.unchecked) > 0.5) {
+			value = `<span style="color:var(--orange-600)">${value}</span>`;
 		}
 		if (column.fieldname === "uncounted_shifts" && data.uncounted_shifts) {
 			value = `<span style="color:var(--orange-600);font-weight:600">${value}</span>`;
